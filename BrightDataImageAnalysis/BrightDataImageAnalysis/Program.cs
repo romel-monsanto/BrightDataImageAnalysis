@@ -2,6 +2,7 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
 using Microsoft.Extensions.Configuration;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -28,17 +29,35 @@ var imageExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"
 };
 
-var results = new List<ImageAnalysisResult>();
-
+// Phase 1: collect all image blobs
 Console.WriteLine($"Scanning folder: {blobConfig.FolderName}");
-
+var imageBlobs = new List<BlobItem>();
 await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig.FolderName))
 {
-    var ext = Path.GetExtension(blob.Name);
-    if (!imageExtensions.Contains(ext))
-        continue;
+    if (imageExtensions.Contains(Path.GetExtension(blob.Name)))
+        imageBlobs.Add(blob);
+}
+Console.WriteLine($"Found {imageBlobs.Count} images. Processing with concurrency: {cuConfig.MaxConcurrency}");
 
-    Console.WriteLine($"\n--- Processing: {blob.Name} ---");
+// Phase 2: analyze all images in parallel
+var results = new ConcurrentBag<ImageAnalysisResult>();
+
+await Parallel.ForEachAsync(imageBlobs,
+    new ParallelOptions { MaxDegreeOfParallelism = cuConfig.MaxConcurrency },
+    async (blob, _) =>
+    {
+        var result = await AnalyzeImageAsync(blob);
+        if (result is not null)
+            results.Add(result);
+    });
+
+Console.WriteLine("\n=== Results ===");
+Console.WriteLine(JsonSerializer.Serialize(results.ToList(), new JsonSerializerOptions { WriteIndented = true }));
+Console.WriteLine($"\nTotal processed: {results.Count}");
+
+async Task<ImageAnalysisResult?> AnalyzeImageAsync(BlobItem blob)
+{
+    Console.WriteLine($"Submitting: {blob.Name}");
 
     // Generate blob-level SAS URI (1 hour, read-only)
     var blobClient = containerClient.GetBlobClient(blob.Name);
@@ -64,8 +83,8 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
 
     if (!submitResponse.IsSuccessStatusCode)
     {
-        Console.WriteLine($"  Submit failed ({submitResponse.StatusCode}): {submitBody}");
-        continue;
+        Console.WriteLine($"  Submit failed ({submitResponse.StatusCode}) [{blob.Name}]: {submitBody}");
+        return null;
     }
 
     var submitJson = JsonNode.Parse(submitBody);
@@ -73,8 +92,8 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
 
     if (string.IsNullOrEmpty(operationId))
     {
-        Console.WriteLine($"  No operation id in response: {submitBody}");
-        continue;
+        Console.WriteLine($"  No operation id [{blob.Name}]: {submitBody}");
+        return null;
     }
 
     var pollUrl = $"{cuConfig.Endpoint}/contentunderstanding/analyzerResults/{operationId}" +
@@ -91,7 +110,7 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
         var pollJson = JsonNode.Parse(pollBody);
         var status = pollJson?["status"]?.GetValue<string>();
 
-        Console.WriteLine($"  Status: {status}");
+        Console.WriteLine($"  [{blob.Name}] Status: {status}");
 
         if (status == "Succeeded")
         {
@@ -100,15 +119,15 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
         }
         else if (status == "Failed")
         {
-            Console.WriteLine($"  Analysis failed: {pollBody}");
+            Console.WriteLine($"  Analysis failed [{blob.Name}]: {pollBody}");
             break;
         }
     }
 
     if (resultJson is null)
     {
-        Console.WriteLine("  Timed out or failed — skipping.");
-        continue;
+        Console.WriteLine($"  Timed out or failed — skipping: {blob.Name}");
+        return null;
     }
 
     // Map to ImageAnalysisResult
@@ -130,7 +149,7 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
     var (interestParent, interestChildren, interestGrandChildren) = ParseHierarchy(interestPaths);
     var (traitParent, traitChildren, traitGrandChildren) = ParseHierarchy(traitPaths);
 
-    results.Add(new ImageAnalysisResult(
+    return new ImageAnalysisResult(
         blob.Name,
         contentSummary,
         interestPaths,
@@ -140,7 +159,7 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
         interestGrandChildren,
         traitParent,
         traitChildren,
-        traitGrandChildren));
+        traitGrandChildren);
 }
 
 static (string parent, string children, string grandChildren) ParseHierarchy(List<string> paths)
@@ -161,10 +180,6 @@ static (string parent, string children, string grandChildren) ParseHierarchy(Lis
     return (parent, children, grandChildren);
 }
 
-Console.WriteLine("\n=== Results ===");
-Console.WriteLine(JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
-Console.WriteLine($"\nTotal processed: {results.Count}");
-
 record ImageAnalysisResult(
     string FileName,
     string? ContentSummary,
@@ -181,7 +196,8 @@ record ContentUnderstandingConfig(
     string Endpoint,
     string SubscriptionKey,
     string AnalyzerId,
-    string ApiVersion);
+    string ApiVersion,
+    int MaxConcurrency);
 
 record BlobStorageConfig(
     string ConnectionString,
