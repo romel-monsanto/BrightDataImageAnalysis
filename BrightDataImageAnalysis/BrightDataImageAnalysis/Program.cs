@@ -127,7 +127,38 @@ await foreach (BlobItem blob in containerClient.GetBlobsAsync(prefix: blobConfig
         .Select(x => x?["valueString"]?.GetValue<string>() ?? string.Empty)
         .ToList() ?? [];
 
-    results.Add(new ImageAnalysisResult(blob.Name, contentSummary, interestPaths, traitPaths));
+    var (interestParent, interestChildren, interestGrandChildren) = ParseHierarchy(interestPaths);
+    var (traitParent, traitChildren, traitGrandChildren) = ParseHierarchy(traitPaths);
+
+    results.Add(new ImageAnalysisResult(
+        blob.Name,
+        contentSummary,
+        interestPaths,
+        traitPaths,
+        interestParent,
+        interestChildren,
+        interestGrandChildren,
+        traitParent,
+        traitChildren,
+        traitGrandChildren));
+}
+
+static (string parent, string children, string grandChildren) ParseHierarchy(List<string> paths)
+{
+    if (paths.Count == 0)
+        return (string.Empty, string.Empty, string.Empty);
+
+    var split = paths.Select(p => p.Split(" > ")).ToList();
+
+    var parent = split.Select(s => s[0]).FirstOrDefault() ?? string.Empty;
+
+    var children = string.Join(" | ",
+        split.Where(s => s.Length >= 2).Select(s => s[1]).Distinct());
+
+    var grandChildren = string.Join(" | ",
+        split.Where(s => s.Length >= 3).Select(s => s[2]).Distinct());
+
+    return (parent, children, grandChildren);
 }
 
 Console.WriteLine("\n=== Results ===");
@@ -138,7 +169,13 @@ record ImageAnalysisResult(
     string FileName,
     string? ContentSummary,
     List<string> InterestHierarchyPath,
-    List<string> TraitHierarchyPath);
+    List<string> TraitHierarchyPath,
+    string InterestParent,
+    string InterestChildren,
+    string InterestGrandChildren,
+    string TraitParent,
+    string TraitChildren,
+    string TraitGrandChildren);
 
 record ContentUnderstandingConfig(
     string Endpoint,
