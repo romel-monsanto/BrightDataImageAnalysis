@@ -238,7 +238,8 @@ static (string parent, string children, string grandChildren) ParseHierarchy(Lis
 
     var split = paths.Select(p => p.Split(" > ")).ToList();
 
-    var parent = split.Select(s => s[0]).FirstOrDefault() ?? string.Empty;
+    var parent = string.Join(" | ",
+        split.Where(s => s.Length >= 1).Select(s => s[0]).Distinct());
 
     var children = string.Join(" | ",
         split.Where(s => s.Length >= 2).Select(s => s[1]).Distinct());
